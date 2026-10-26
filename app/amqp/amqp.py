@@ -206,6 +206,7 @@ class AmqpClient:
         auto_ack: bool,
         exclusive: bool,
         msg_callback: Callable[[BlockingChannel, Basic.Deliver, BasicProperties, bytes], None],
+        prefetch_count: int = 1,
     ) -> None:
         """Signal to consume messages from the queue and bind to message callback.
 
@@ -214,8 +215,9 @@ class AmqpClient:
         :param bool auto_ack: Whether to automatically acknowledge messages
         :param bool exclusive: Whether to set exclusive consumer
         :param callable msg_callback: Callback function to handle received messages
+        :param int prefetch_count: Maximum number of unacknowledged messages, 0 means no limit
         """
-        channel.basic_qos(prefetch_count=1, prefetch_size=0)
+        channel.basic_qos(prefetch_count=prefetch_count, prefetch_size=0)
         channel.basic_consume(
             queue=queue,
             auto_ack=auto_ack,
@@ -243,7 +245,7 @@ class AmqpClient:
 
                 with self._connection.channel() as channel:
                     self._bind_queue(channel, self._config.amqpExchangeName, queue, routing_key)
-                    self._consume_queue(channel, queue, False, False, msg_callback)
+                    self._consume_queue(channel, queue, False, False, msg_callback, self._config.amqpPrefetchCount)
                     logger.info(f"Start consuming on queue '{queue}'")
                     channel.start_consuming()
             except (AMQPConnectionError, ChannelClosedByBroker) as exc:

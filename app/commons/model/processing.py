@@ -27,6 +27,15 @@ class ProcessingItem:
     item: Any = field(compare=False)
     send_time: Optional[float] = field(default=None, compare=False)
     retries: int = field(default=0, compare=False)
+    delivery_tag: Optional[int] = field(default=None, compare=False)
+    # The AMQP channel the message arrived on, used to settle it. Not sent to the worker process.
+    channel: Any = field(default=None, compare=False, repr=False)
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Drop the AMQP channel when the item is pickled for the worker process."""
+        state = self.__dict__.copy()
+        state["channel"] = None
+        return state
 
 
 @dataclass
