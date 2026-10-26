@@ -210,6 +210,7 @@ APP_CONFIG = ApplicationConfig(
     amqpBackoffFactor=int(os.getenv("AMQP_BACKOFF_FACTOR", "2")),
     amqpHandlerMaxRetries=int(os.getenv("AMQP_HANDLER_MAX_RETRIES", "3")),
     amqpHandlerTaskTimeout=int(os.getenv("AMQP_HANDLER_TASK_TIMEOUT", "600")),
+    amqpPrefetchCount=max(0, int(os.getenv("AMQP_PREFETCH_COUNT", "2"))),
     analyzerPriority=int(os.getenv("ANALYZER_PRIORITY", "1")),
     analyzerIndex=to_bool(os.getenv("ANALYZER_INDEX", "true")),
     analyzerLogSearch=to_bool(os.getenv("ANALYZER_LOG_SEARCH", "true")),

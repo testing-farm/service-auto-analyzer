@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import json
+import pickle
 import time
 from typing import Any, Generator
 from unittest.mock import Mock, patch
@@ -21,7 +22,7 @@ import pytest
 from pika.adapters.blocking_connection import BlockingChannel
 from pika.spec import Basic, BasicProperties
 
-from app.amqp.amqp_handler import ProcessAmqpRequestHandler
+from app.amqp.amqp_handler import DirectAmqpRequestHandler, ProcessAmqpRequestHandler, settle_message
 from app.amqp.routing import empty_reply
 from app.commons.model.launch_objects import ApplicationConfig, SearchConfig
 from app.commons.model.processing import ProcessingItem
@@ -85,16 +86,30 @@ def create_test_processing_item(
     )
 
 
-def create_amqp_request_mock(
-    routing_key="noop_echo", body: Any = "test_data", reply_to="test_reply", correlation_id="test_correlation"
-):
-    """Helper to create AMQP request mocks"""
+def create_channel_mock() -> Mock:
+    """Helper to create an open channel mock that runs thread-safe callbacks immediately"""
     channel = Mock(spec=BlockingChannel)
     channel.basic_ack = Mock()
+    channel.basic_nack = Mock()
+    channel.is_open = True
+    channel.connection.add_callback_threadsafe.side_effect = lambda callback: callback()
+    return channel
+
+
+def create_amqp_request_mock(
+    routing_key="noop_echo",
+    body: Any = "test_data",
+    reply_to="test_reply",
+    correlation_id="test_correlation",
+    delivery_tag=123,
+    channel=None,
+):
+    """Helper to create AMQP request mocks"""
+    channel = channel or create_channel_mock()
 
     method = Mock(spec=Basic.Deliver)
     method.routing_key = routing_key
-    method.delivery_tag = 123
+    method.delivery_tag = delivery_tag
 
     props = Mock(spec=BasicProperties)
     props.reply_to = reply_to
@@ -129,6 +144,9 @@ class TestProcessAmqpRequestHandler:
 
         # Wait a bit for task to be picked up and sent to processor
         time.sleep(0.1)
+
+        # Verify the message is not acked before the task finishes
+        channel.basic_ack.assert_not_called()
 
         # Verify task appears in running_tasks
         running_tasks = handler.running_tasks
@@ -348,9 +366,10 @@ class TestProcessAmqpRequestHandler:
             # Wait a bit
             time.sleep(0.2)
 
-            # Verify task was filtered out (not processed)
+            # Verify task was filtered out (not processed) and acked
             assert len(handler.running_tasks) == 0
             mock_amqp_client.reply.assert_not_called()
+            channel.basic_ack.assert_called_once_with(delivery_tag=123)
         finally:
             handler.shutdown()
 
@@ -432,6 +451,10 @@ class TestProcessAmqpRequestHandler:
 
         mock_amqp_client.reply.assert_not_called()
         assert handler.processor.is_alive(), "Processor should be alive after handling failed task"
+
+        # Verify the message was acked once, after the last retry
+        channel.basic_ack.assert_called_once_with(delivery_tag=123)
+        channel.basic_nack.assert_not_called()
 
     @patch("app.amqp.amqp_handler.LOGGER")
     def test_custom_retry_predicate(self, mock_logger, app_config, search_config, mock_amqp_client):
@@ -580,6 +603,131 @@ def test_dropped_request_reply(
             assert kwargs["routing_key"] == reply_to
             assert kwargs["properties"].correlation_id == "corr-1"
             assert kwargs["body"] == expected
+        # The dropped message is acked
+        channel.basic_ack.assert_called_once_with(delivery_tag=123)
         mock_amqp_client.reply.assert_not_called()
     finally:
         handler.shutdown()
+
+    def test_restart_requeues_waiting_tasks(self, handler, mock_amqp_client):
+        """Restarting the processor resends the running task and returns the waiting one to RabbitMQ"""
+        channel = create_channel_mock()
+        for tag, sleep in ((1, 3), (2, 1)):
+            request = create_amqp_request_mock(routing_key="noop_sleep", body=sleep, delivery_tag=tag, channel=channel)
+            handler.handle_amqp_request(*request)
+        time.sleep(0.1)
+        assert [task.delivery_tag for task in handler.running_tasks] == [1, 2]
+
+        # Kill the processor process
+        handler.processor.process.terminate()
+        handler.processor.process.join(timeout=1)
+        time.sleep(0.5)
+
+        # The waiting task goes back to RabbitMQ, the running one stays with the new processor
+        channel.basic_nack.assert_called_once_with(delivery_tag=2, requeue=True)
+        running_tasks = handler.running_tasks
+        assert [task.delivery_tag for task in running_tasks] == [1]
+        assert running_tasks[0].retries == 1
+        channel.basic_ack.assert_not_called()
+
+        # Wait for the resent task to complete
+        time.sleep(10)
+        assert len(handler.running_tasks) == 0
+        channel.basic_ack.assert_called_once_with(delivery_tag=1)
+
+    def test_closed_channel_skips_settling(self, handler, mock_amqp_client):
+        """A task whose channel closed finishes without ack, a queued one is not processed"""
+        channel = create_channel_mock()
+        for tag in (1, 2, 3):
+            request = create_amqp_request_mock(routing_key="noop_sleep", body=1, delivery_tag=tag, channel=channel)
+            handler.handle_amqp_request(*request)
+        time.sleep(0.1)
+        assert len(handler.running_tasks) == 2
+        assert handler.queue.qsize() == 1
+
+        # The connection drops: the broker requeues all unacked messages
+        channel.is_open = False
+        channel.connection.add_callback_threadsafe.side_effect = Exception("connection closed")
+
+        time.sleep(10)
+        assert len(handler.running_tasks) == 0
+        assert handler.queue.qsize() == 0
+        channel.basic_ack.assert_not_called()
+        channel.basic_nack.assert_not_called()
+        # Only the two running tasks were processed, the queued one was skipped
+        assert channel.connection.add_callback_threadsafe.call_count == 2
+
+    def test_empty_message_is_acked(self, handler, mock_amqp_client):
+        """An empty message is dropped and acked"""
+        channel, method, props, body = create_amqp_request_mock(body=[])
+        handler.handle_amqp_request(channel, method, props, body)
+        channel.basic_ack.assert_called_once_with(delivery_tag=123)
+        assert handler.queue.qsize() == 0
+
+    def test_queue_size_defaults_to_prefetch(self, app_config, search_config, mock_amqp_client):
+        """The in-memory queue holds at most the prefetch count"""
+        app_config.amqpPrefetchCount = 3
+        handler = ProcessAmqpRequestHandler(
+            app_config=app_config, search_config=search_config, client=mock_amqp_client, init_services=["noop_echo"]
+        )
+        try:
+            assert handler.queue.maxsize == 3
+        finally:
+            handler.shutdown()
+
+
+def test_processing_item_pickle_drops_channel():
+    """The channel stays in the handler process, the delivery tag travels with the item"""
+    item = create_test_processing_item()
+    item.delivery_tag = 7
+    item.channel = create_channel_mock()
+    restored = pickle.loads(pickle.dumps(item))
+    assert restored.channel is None
+    assert restored.delivery_tag == 7
+    assert item.channel is not None
+
+
+def test_settle_message_once():
+    """A processing item is settled once"""
+    channel = create_channel_mock()
+    item = create_test_processing_item()
+    item.delivery_tag = 5
+    item.channel = channel
+    settle_message(item)
+    settle_message(item, requeue=True)
+    channel.basic_ack.assert_called_once_with(delivery_tag=5)
+    channel.basic_nack.assert_not_called()
+
+
+def test_settle_message_closed_channel():
+    """Settling on a closed channel does nothing"""
+    channel = create_channel_mock()
+    channel.is_open = False
+    item = create_test_processing_item()
+    item.delivery_tag = 5
+    item.channel = channel
+    settle_message(item)
+    channel.basic_ack.assert_not_called()
+
+
+def test_direct_handler_acks_after_processing(app_config, search_config):
+    """The direct handler acks after it publishes the response"""
+    handler = DirectAmqpRequestHandler(app_config, search_config, init_services=["noop_echo"])
+    channel, method, props, body = create_amqp_request_mock(routing_key="noop_echo", body="hello")
+    calls = []
+    channel.basic_publish.side_effect = lambda **_: calls.append("publish")
+    channel.basic_ack.side_effect = lambda **_: calls.append("ack")
+    handler.handle_amqp_request(channel, method, props, body)
+    assert calls == ["publish", "ack"]
+    channel.basic_ack.assert_called_once_with(delivery_tag=123)
+
+
+def test_direct_handler_acks_filtered_message(app_config, search_config):
+    """The direct handler acks a message the routing key predicate drops"""
+    handler = DirectAmqpRequestHandler(
+        app_config, search_config, routing_key_predicate=lambda key: key != "noop_echo", init_services=["noop_echo"]
+    )
+    channel, method, props, body = create_amqp_request_mock(routing_key="noop_echo", body="hello")
+    handler.handle_amqp_request(channel, method, props, body)
+    channel.basic_ack.assert_called_once_with(delivery_tag=123)
+    channel.basic_publish.assert_not_called()

@@ -48,16 +48,59 @@ def log_outgoing_message(reply_to: str, correlation_id: str, body: Any) -> None:
 
 
 def serialize_message(channel: BlockingChannel, delivery_tag: Optional[int], body: bytes) -> Optional[Any]:
+    """Parse the message body.
+
+    Rejects a message that is not valid JSON and acks an empty one, since callers drop both. Callers settle
+    the other messages once they are processed. Must run on the connection thread.
+    """
     try:
         message = json.loads(body, strict=False)
-        if delivery_tag is not None:
-            channel.basic_ack(delivery_tag=delivery_tag)
-        return message
     except Exception as exc:
         LOGGER.exception("Failed to parse message body to JSON", exc_info=exc)
         if delivery_tag is not None:
             channel.basic_nack(delivery_tag=delivery_tag, requeue=False)
         return None
+    if not message and delivery_tag is not None:
+        channel.basic_ack(delivery_tag=delivery_tag)
+    return message
+
+
+_SETTLE_LOCK = threading.Lock()
+
+
+def settle_message(item: ProcessingItem, requeue: bool = False) -> None:
+    """Ack the AMQP message of a processing item, or nack it with requeue.
+
+    Safe to call from any thread: pika's ``BlockingChannel`` is not thread-safe, so the ack runs on the
+    connection thread through ``add_callback_threadsafe``. The item is settled once, later calls do nothing.
+    If the channel is closed by then, the broker has already requeued the message and nothing is sent.
+
+    :param ProcessingItem item: The processing item to settle
+    :param bool requeue: Nack the message with requeue instead of acking it
+    """
+    with _SETTLE_LOCK:
+        channel = item.channel
+        item.channel = None
+    delivery_tag = item.delivery_tag
+    if channel is None or delivery_tag is None:
+        return
+
+    def _settle() -> None:
+        if not channel.is_open:
+            LOGGER.warning(f"AMQP channel closed, the broker requeued message {delivery_tag}")
+            return
+        try:
+            if requeue:
+                channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+            else:
+                channel.basic_ack(delivery_tag=delivery_tag)
+        except Exception as exc:
+            LOGGER.exception(f"Failed to settle message {delivery_tag}", exc_info=exc)
+
+    try:
+        channel.connection.add_callback_threadsafe(_settle)
+    except Exception as exc:
+        LOGGER.warning(f"AMQP connection closed, the broker requeued message {delivery_tag}", exc_info=exc)
 
 
 def reply_to_dropped(
@@ -186,7 +229,7 @@ class ProcessAmqpRequestHandler:
         app_config: ApplicationConfig,
         search_config: SearchConfig,
         *,
-        queue_size: int = 100,
+        queue_size: Optional[int] = None,
         routing_key_predicate: Optional[Callable[[str], bool]] = None,
         dropped_reply: Optional[Callable[[str], Optional[str]]] = None,
         client: Optional[AmqpClient] = None,
@@ -198,7 +241,8 @@ class ProcessAmqpRequestHandler:
 
         :param ApplicationConfig app_config: Application configuration object
         :param SearchConfig search_config: Search configuration object
-        :param int queue_size: Maximum size of the internal priority queue (buffer)
+        :param Optional[int] queue_size: Maximum size of the internal priority queue (buffer), defaults to
+        ``amqpPrefetchCount`` since RabbitMQ never delivers more unacknowledged messages than that
         :param Optional[Callable[[str], bool]] routing_key_predicate: Optional predicate to filter routing keys for
         processing. Should return True for keys to process.
         :param Optional[Callable[[str], Optional[str]]] dropped_reply: Optional function that returns the reply body
@@ -213,7 +257,7 @@ class ProcessAmqpRequestHandler:
         self.app_config = app_config
         self.search_config = search_config
         self.client = client or AmqpClient(app_config)
-        self.queue_size = queue_size
+        self.queue_size = queue_size if queue_size is not None else app_config.amqpPrefetchCount
         self.routing_key_predicate = routing_key_predicate or (lambda _: True)
         self.dropped_reply = dropped_reply
         if init_services:
@@ -224,7 +268,7 @@ class ProcessAmqpRequestHandler:
         self.counter = AtomicInteger(0)
 
         # Initialize queue and running tasks
-        self.queue = PriorityQueue(maxsize=queue_size)
+        self.queue = PriorityQueue(maxsize=self.queue_size)
         self.__running_tasks = Queue()
 
         # Setup process communication
@@ -256,9 +300,18 @@ class ProcessAmqpRequestHandler:
         processing_item.send_time = time.time()  # Record send time for tracking
 
     def __send_to_processor(self) -> Optional[ProcessingItem]:
+        processing_item: Optional[ProcessingItem] = None
         try:
-            processing_item: ProcessingItem = self.queue.get_nowait()
+            processing_item = self.queue.get_nowait()
             logging.set_correlation_id(processing_item.log_correlation_id)
+            channel = processing_item.channel
+            if channel is not None and not channel.is_open:
+                # The broker requeued the message when the channel closed and delivers it again
+                LOGGER.info(
+                    f"AMQP channel closed, skipping message {processing_item.routing_key} - "
+                    f"{processing_item.msg_correlation_id}"
+                )
+                return processing_item
             log_incoming_message(processing_item.routing_key, processing_item.msg_correlation_id, processing_item.item)
             self.__send_task_lock(processing_item)
             return processing_item
@@ -266,6 +319,8 @@ class ProcessAmqpRequestHandler:
             return None
         except Exception as exc:
             LOGGER.exception("Failed to send message to processor", exc_info=exc)
+            if processing_item is not None:
+                settle_message(processing_item, requeue=True)
             return None
 
     def __send_task_no_lock(self, processing_item: ProcessingItem) -> None:
@@ -307,15 +362,22 @@ class ProcessAmqpRequestHandler:
             # Increment retries for the first task, since it might be the one that caused the failure
             tasks_to_resend[0].retries += 1
 
-            # Re-send all previously running tasks to the new processor
+            # Re-send the first task to the new processor, it keeps its retry count this way. Return the other
+            # tasks, which had not started, to RabbitMQ, so any consumer can take them.
             resent = 0
-            for task in tasks_to_resend:
+            requeued = 0
+            for i, task in enumerate(tasks_to_resend):
                 if task.retries >= self.app_config.amqpHandlerMaxRetries:
                     LOGGER.warning(
                         f"Task exceeded max retries, skipping. --Routing key: {task.routing_key}"
                         f" --Correlation ID: {task.msg_correlation_id} Body: {json.dumps(task.item)}",
                         correlation_id=task.log_correlation_id,
                     )
+                    settle_message(task)
+                    continue
+                if i > 0 and task.channel is not None:
+                    settle_message(task, requeue=True)
+                    requeued += 1
                     continue
                 try:
                     self.__send_task_no_lock(task)
@@ -323,7 +385,8 @@ class ProcessAmqpRequestHandler:
                     LOGGER.debug(f"Re-sent task to new processor: {task.routing_key} - {task.msg_correlation_id}")
                 except Exception as exc:
                     LOGGER.exception(f"Failed to re-send task {task.routing_key} to new processor", exc_info=exc)
-            LOGGER.info(f"Re-sent {resent} tasks to new processor")
+                    settle_message(task, requeue=True)
+            LOGGER.info(f"Re-sent {resent} tasks to new processor, returned {requeued} tasks to the queue")
 
     def __has_long_running_tasks(self) -> bool:
         """Check if there are any long-running tasks that need attention"""
@@ -356,28 +419,34 @@ class ProcessAmqpRequestHandler:
         LOGGER.debug("Finished processing response")
         return None
 
-    def __remove_last_task_from_queue(self, result: ProcessingResult):
+    def __remove_last_task_from_queue(self, result: ProcessingResult) -> Optional[ProcessingItem]:
+        """Remove the finished task from the running tasks and return it."""
         try:
-            completed_task = self.__running_tasks.get()
+            completed_task = self.__running_tasks.get_nowait()
             if completed_task.msg_correlation_id != result.item.msg_correlation_id:
                 LOGGER.warning(
                     f"Received result for task {result.item.msg_correlation_id} but expected "
                     f"{completed_task.msg_correlation_id}. Possible mismatch."
                 )
+            return completed_task
         except Empty:
             LOGGER.warning(QUEUE_POSSIBLE_BUG)
+            return None
 
     def __process_result(self, result: ProcessingResult) -> None:
         # Handle successful result
         if result.success:
             # Remove the completed task from running queue
-            self.__remove_last_task_from_queue(result)
+            completed_task = self.__remove_last_task_from_queue(result)
             if result.item.retries > 0:
                 LOGGER.warning(
                     f"Task {result.item.routing_key} - {result.item.msg_correlation_id} "
                     f"was retried {result.item.retries} times"
                 )
             self.__handle_response(result)
+            # Ack after the reply is published, so a crash in between redelivers the message
+            if completed_task:
+                settle_message(completed_task)
             return
 
         # Handle failed result - check if we should retry
@@ -396,7 +465,9 @@ class ProcessAmqpRequestHandler:
 
         # If we should NOT retry, remove the task from running queue
         if not should_retry or exceeded_max_retries:
-            self.__remove_last_task_from_queue(result)
+            completed_task = self.__remove_last_task_from_queue(result)
+            if completed_task:
+                settle_message(completed_task)
             LOGGER.error(
                 f"Task failed after {result.item.retries} retries. --Routing key: {result.item.routing_key}"
                 f" --Correlation ID: {result.item.msg_correlation_id} Body: {json.dumps(result.item.item)}"
@@ -500,18 +571,23 @@ class ProcessAmqpRequestHandler:
         props: BasicProperties,
         body: bytes,
     ) -> None:
-        """Function for handling amqp request: convert to ProcessingItem and add to priority queue."""
+        """Function for handling amqp request: convert to ProcessingItem and add to priority queue.
+
+        The message stays unacknowledged until its task finishes, so the RabbitMQ prefetch limits how many
+        messages this handler holds.
+        """
         number: int = self.counter.inc()
         logging.new_correlation_id()
-
-        # Processing request
-        message = serialize_message(channel, method.delivery_tag, body)
-        if not message:
-            return None
 
         routing_key = method.routing_key or ""
         if not self.routing_key_predicate(routing_key):
             reply_to_dropped(channel, routing_key, props, self.dropped_reply)
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+            return None
+
+        # Processing request
+        message = serialize_message(channel, method.delivery_tag, body)
+        if not message:
             return None
 
         priority = get_priority(props)
@@ -525,6 +601,8 @@ class ProcessAmqpRequestHandler:
             log_correlation_id=logging.get_correlation_id(),
             msg_correlation_id=props.correlation_id or "",
             item=message,
+            delivery_tag=method.delivery_tag,
+            channel=channel,
         )
 
         # Add to priority queue (blocking on overflow)
@@ -532,6 +610,7 @@ class ProcessAmqpRequestHandler:
             self.queue.put(processing_item, block=True)
         except Exception as exc:
             LOGGER.exception("Failed to add item to processing queue", exc_info=exc)
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
             return None
         return None
 
@@ -614,16 +693,33 @@ class DirectAmqpRequestHandler:
         """Function for handling amqp request: index, search and analyze using routing key."""
         logging.new_correlation_id()
 
+        routing_key = method.routing_key or ""
+        if not self.routing_key_predicate(routing_key):
+            reply_to_dropped(channel, routing_key, props, self.dropped_reply)
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+            return None
+
         # Processing request
         message = serialize_message(channel, method.delivery_tag, body)
         if not message:
             return None
 
-        routing_key = method.routing_key or ""
-        if not self.routing_key_predicate(routing_key):
-            reply_to_dropped(channel, routing_key, props, self.dropped_reply)
-            return None
+        try:
+            self.__process_message(channel, method, props, routing_key, message)
+        finally:
+            # Ack once processing finishes, successful or not
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+        return None
 
+    def __process_message(
+        self,
+        channel: BlockingChannel,
+        method: Basic.Deliver,
+        props: BasicProperties,
+        routing_key: str,
+        message: Any,
+    ) -> None:
+        """Process a parsed message and publish the response."""
         self.counter += 1
         log_incoming_message(routing_key, props.correlation_id or "", message)
 

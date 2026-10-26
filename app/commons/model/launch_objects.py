@@ -77,6 +77,8 @@ class ApplicationConfig(BaseModel):
     amqpBackoffFactor: int = 2
     amqpHandlerMaxRetries: int = 3
     amqpHandlerTaskTimeout: int = 600
+    # Unacknowledged messages a consumer holds; matches NUMBER_OF_TASKS_TO_SEND in app.amqp.amqp_handler
+    amqpPrefetchCount: int = 2
     analyzerResponseExchange: str = "analyzer-reply"
     analyzerResponseExchangeType: str = "direct"
     analyzerResponseQueue: str = "analysis.matches"
