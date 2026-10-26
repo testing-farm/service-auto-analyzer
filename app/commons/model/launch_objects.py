@@ -56,6 +56,7 @@ class ApplicationConfig(BaseModel):
     amqpUrl: str = ""
     amqpExchangeName: str = "analyzer"
     amqpExchangeType: str = "fanout"
+    amqpQueueName: str = "all"
     amqpHeartbeatInterval: int = 30
     amqpInitialRetryInterval: int = 1
     amqpMaxRetryTime: int = 300
@@ -70,6 +71,7 @@ class ApplicationConfig(BaseModel):
     analyzerLogSearch: bool = True
     analyzerSuggest: bool = True
     analyzerCluster: bool = True
+    analyzerRoutingKeys: list[str] = []
     turnOffSslVerification: bool = False
     appVersion: str = ""
 

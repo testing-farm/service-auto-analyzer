@@ -27,6 +27,14 @@ from flask_wtf.csrf import CSRFProtect
 
 from app.amqp.amqp import AmqpClient
 from app.amqp.amqp_handler import AmqpRequestHandler, DirectAmqpRequestHandler, ProcessAmqpRequestHandler
+from app.amqp.routing import (
+    empty_reply,
+    main_handler_services,
+    main_routing_key_predicate,
+    only_train,
+    to_list,
+    unknown_routing_keys,
+)
 from app.commons import logging as my_logging
 from app.commons.esclient import EsClient
 from app.commons.model.launch_objects import ApplicationConfig, SearchConfig
@@ -195,6 +203,7 @@ APP_CONFIG = ApplicationConfig(
     # AMQP settings
     amqpUrl=os.getenv("AMQP_URL", "").strip("/").strip("\\") + "/" + os.getenv("AMQP_VIRTUAL_HOST", "analyzer"),
     amqpExchangeName=os.getenv("AMQP_EXCHANGE_NAME", "analyzer"),
+    amqpQueueName=os.getenv("AMQP_QUEUE_NAME", "all").strip() or "all",
     amqpInitialRetryInterval=int(os.getenv("AMQP_INITIAL_RETRY_INTERVAL", "1")),
     amqpMaxRetryTime=int(os.getenv("AMQP_MAX_RETRY_TIME", "300")),
     amqpHeartbeatInterval=int(os.getenv("AMQP_HEARTBEAT_INTERVAL", "30")),
@@ -206,6 +215,7 @@ APP_CONFIG = ApplicationConfig(
     analyzerLogSearch=to_bool(os.getenv("ANALYZER_LOG_SEARCH", "true")),
     analyzerSuggest=to_bool(os.getenv("ANALYZER_SUGGEST", "true")),
     analyzerCluster=to_bool(os.getenv("ANALYZER_CLUSTER", "true")),
+    analyzerRoutingKeys=to_list(os.getenv("ANALYZER_ROUTING_KEYS")),
     appVersion="",
     # Storage settings
     datastoreType=datastore_type,
@@ -269,16 +279,6 @@ def create_thread(func, args, name: str):
     return thread
 
 
-def except_train(request: str) -> bool:
-    """Filters out requests that are for training models"""
-    return request != "train_models"
-
-
-def only_train(request: str) -> bool:
-    """Filters out requests that are not related to training models"""
-    return request == "train_models"
-
-
 def init_amqp_queues():
     """Initialize rabbitmq queues, exchange and starts threads for queue messages processing"""
     _threads = []
@@ -291,30 +291,11 @@ def init_amqp_queues():
     _main_amqp_handler = handler_class(
         APP_CONFIG,
         SEARCH_CONFIG,
-        routing_key_predicate=except_train,
+        routing_key_predicate=main_routing_key_predicate(APP_CONFIG.analyzerRoutingKeys),
+        # Only the main handler answers requests it drops: the train handler sees every message on the exchange
+        dropped_reply=empty_reply if APP_CONFIG.analyzerRoutingKeys else None,
         name="main_handler",
-        init_services=[
-            "index",
-            "analyze",
-            "delete",
-            "clean",
-            "search",
-            "suggest",
-            "cluster",
-            "stats_info",
-            "namespace_finder",
-            "suggest_patterns",
-            "index_suggest_info",
-            "remove_suggest_info",
-            "update_suggest_info",
-            "remove_models",
-            "get_model_info",
-            "defect_update",
-            "item_remove",
-            "launch_remove",
-            "remove_by_launch_start_time",
-            "remove_by_log_time",
-        ],
+        init_services=main_handler_services(APP_CONFIG.analyzerRoutingKeys),
     )
     _train_amqp_handler = None
     if not APP_CONFIG.disableTrain:
@@ -326,17 +307,23 @@ def init_amqp_queues():
             init_services=["train_models"],
         )
 
+    main_queue = APP_CONFIG.amqpQueueName
+    if APP_CONFIG.analyzerRoutingKeys:
+        logger.info(f"Main handler routing keys: {', '.join(APP_CONFIG.analyzerRoutingKeys)}")
+        unknown = unknown_routing_keys(APP_CONFIG.analyzerRoutingKeys)
+        if unknown:
+            logger.warning(f"Unknown routing keys in ANALYZER_ROUTING_KEYS: {', '.join(unknown)}")
     _threads.append(
         (
-            "all",
+            main_queue,
             create_thread(
                 AmqpClient(APP_CONFIG).receive,
                 (
-                    "all",
+                    main_queue,
                     _main_amqp_handler.handle_amqp_request,
                     None,
                 ),
-                "all",
+                main_queue,
             ),
             _main_amqp_handler,
         )

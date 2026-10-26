@@ -22,6 +22,7 @@ from pika.adapters.blocking_connection import BlockingChannel
 from pika.spec import Basic, BasicProperties
 
 from app.amqp.amqp_handler import ProcessAmqpRequestHandler
+from app.amqp.routing import empty_reply
 from app.commons.model.launch_objects import ApplicationConfig, SearchConfig
 from app.commons.model.processing import ProcessingItem
 
@@ -540,3 +541,46 @@ class TestProcessAmqpRequestHandler:
         # Verify task was dropped after retries
         assert len(handler.running_tasks) == 0, "Tasks should be processed and removed from running_tasks"
         assert handler.queue.qsize() == 0, "Queue should be empty after processing all tasks"
+
+
+@pytest.mark.parametrize(
+    ("routing_key", "reply_to", "with_reply", "expected"),
+    [
+        ("analyze", "reply_queue", True, b"[]"),
+        ("clean", "reply_queue", True, b"0"),
+        ("index", "reply_queue", True, None),
+        ("analyze", None, True, None),
+        ("analyze", "reply_queue", False, None),
+    ],
+)
+def test_dropped_request_reply(
+    app_config, search_config, mock_amqp_client, routing_key, reply_to, with_reply, expected
+):
+    """A request the routing key predicate drops gets an empty reply when it is an RPC with a known reply"""
+    handler = ProcessAmqpRequestHandler(
+        app_config=app_config,
+        search_config=search_config,
+        client=mock_amqp_client,
+        routing_key_predicate=lambda key: key == "suggest",
+        dropped_reply=empty_reply if with_reply else None,
+        init_services=["noop_echo"],
+    )
+    try:
+        channel, method, props, body = create_amqp_request_mock(
+            routing_key=routing_key, body=["data"], reply_to=reply_to, correlation_id="corr-1"
+        )
+        handler.handle_amqp_request(channel, method, props, body)
+
+        assert handler.queue.qsize() == 0
+        if expected is None:
+            channel.basic_publish.assert_not_called()
+        else:
+            channel.basic_publish.assert_called_once()
+            kwargs = channel.basic_publish.call_args.kwargs
+            assert kwargs["exchange"] == ""
+            assert kwargs["routing_key"] == reply_to
+            assert kwargs["properties"].correlation_id == "corr-1"
+            assert kwargs["body"] == expected
+        mock_amqp_client.reply.assert_not_called()
+    finally:
+        handler.shutdown()
