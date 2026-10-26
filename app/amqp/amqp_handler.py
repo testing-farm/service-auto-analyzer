@@ -60,6 +60,36 @@ def serialize_message(channel: BlockingChannel, delivery_tag: Optional[int], bod
         return None
 
 
+def reply_to_dropped(
+    channel: BlockingChannel,
+    routing_key: str,
+    props: BasicProperties,
+    dropped_reply: Optional[Callable[[str], Optional[str]]],
+) -> None:
+    """Reply to an RPC request the routing key predicate dropped, so the caller does not wait for a timeout.
+
+    Must run on the connection thread.
+    """
+    if not dropped_reply or not props.reply_to:
+        return
+    body = dropped_reply(routing_key)
+    if body is None:
+        return
+    try:
+        channel.basic_publish(
+            exchange="",
+            routing_key=props.reply_to,
+            properties=BasicProperties(correlation_id=props.correlation_id, content_type="application/json"),
+            mandatory=False,
+            body=bytes(body, "utf-8"),
+        )
+        LOGGER.debug(
+            f"Replied to dropped request: --Routing key: {routing_key} --Correlation ID: {props.correlation_id}"
+        )
+    except Exception as exc:
+        LOGGER.exception("Failed to reply to dropped request", exc_info=exc)
+
+
 def get_priority(props: BasicProperties) -> int:
     """Determine priority from timestamp_in_ms header or use current time."""
     priority = int(time.time() * 1000)  # Default to current time in milliseconds
@@ -139,6 +169,7 @@ class ProcessAmqpRequestHandler:
     client: AmqpClient
     queue_size: int
     routing_key_predicate: Callable[[str], bool]
+    dropped_reply: Optional[Callable[[str], Optional[str]]]
     counter: AtomicInteger
     queue: Queue[ProcessingItem]
     __running_tasks: Queue[ProcessingItem]
@@ -157,6 +188,7 @@ class ProcessAmqpRequestHandler:
         *,
         queue_size: int = 100,
         routing_key_predicate: Optional[Callable[[str], bool]] = None,
+        dropped_reply: Optional[Callable[[str], Optional[str]]] = None,
         client: Optional[AmqpClient] = None,
         init_services: Optional[list[str]] = None,
         retry_predicate: Optional[Callable[[ProcessingItem, Optional[Exception]], bool]] = retry,
@@ -169,6 +201,8 @@ class ProcessAmqpRequestHandler:
         :param int queue_size: Maximum size of the internal priority queue (buffer)
         :param Optional[Callable[[str], bool]] routing_key_predicate: Optional predicate to filter routing keys for
         processing. Should return True for keys to process.
+        :param Optional[Callable[[str], Optional[str]]] dropped_reply: Optional function that returns the reply body
+        for an RPC request the routing key predicate drops, or None to send no reply
         :param Optional[AmqpClient] client: Optional AMQP client for sending replies (useful for testing)
         :param Optional[list[str]] init_services: Optional list of routing keys to initialize the processor with
         specific routing keys
@@ -181,6 +215,7 @@ class ProcessAmqpRequestHandler:
         self.client = client or AmqpClient(app_config)
         self.queue_size = queue_size
         self.routing_key_predicate = routing_key_predicate or (lambda _: True)
+        self.dropped_reply = dropped_reply
         if init_services:
             self._init_services = set(init_services)
         else:
@@ -224,8 +259,6 @@ class ProcessAmqpRequestHandler:
         try:
             processing_item: ProcessingItem = self.queue.get_nowait()
             logging.set_correlation_id(processing_item.log_correlation_id)
-            if not self.routing_key_predicate(processing_item.routing_key):
-                return processing_item
             log_incoming_message(processing_item.routing_key, processing_item.msg_correlation_id, processing_item.item)
             self.__send_task_lock(processing_item)
             return processing_item
@@ -476,13 +509,18 @@ class ProcessAmqpRequestHandler:
         if not message:
             return None
 
+        routing_key = method.routing_key or ""
+        if not self.routing_key_predicate(routing_key):
+            reply_to_dropped(channel, routing_key, props, self.dropped_reply)
+            return None
+
         priority = get_priority(props)
 
         # Create ProcessingItem
         processing_item = ProcessingItem(
             priority=priority,
             number=number,
-            routing_key=method.routing_key or "",
+            routing_key=routing_key,
             reply_to=props.reply_to,
             log_correlation_id=logging.get_correlation_id(),
             msg_correlation_id=props.correlation_id or "",
@@ -526,6 +564,7 @@ class DirectAmqpRequestHandler:
     app_config: ApplicationConfig
     search_config: SearchConfig
     routing_key_predicate: Callable[[str], bool]
+    dropped_reply: Optional[Callable[[str], Optional[str]]]
     __running_tasks: Queue[ProcessingItem]
     counter: int
     processor: Processor
@@ -538,6 +577,7 @@ class DirectAmqpRequestHandler:
         search_config: SearchConfig,
         *,
         routing_key_predicate: Optional[Callable[[str], bool]] = None,
+        dropped_reply: Optional[Callable[[str], Optional[str]]] = None,
         init_services: Optional[list[str]] = None,
         **_: Any,
     ):
@@ -547,11 +587,14 @@ class DirectAmqpRequestHandler:
         :param search_config: Search configuration object
         :param routing_key_predicate: Optional predicate to filter routing keys for processing. Should return True for
         keys to process.
+        :param dropped_reply: Optional function that returns the reply body for an RPC request the routing key
+        predicate drops, or None to send no reply
         :param init_services: Optional list of routing keys to initialize the processor with specific routing keys
         """
         self.app_config = app_config
         self.search_config = search_config
         self.routing_key_predicate = routing_key_predicate or (lambda _: True)
+        self.dropped_reply = dropped_reply
         self.__running_tasks = Queue()
         if init_services:
             self._init_services = set(init_services)
@@ -578,6 +621,7 @@ class DirectAmqpRequestHandler:
 
         routing_key = method.routing_key or ""
         if not self.routing_key_predicate(routing_key):
+            reply_to_dropped(channel, routing_key, props, self.dropped_reply)
             return None
 
         self.counter += 1
